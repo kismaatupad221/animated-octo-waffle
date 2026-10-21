@@ -3,7 +3,7 @@ on:
   workflow_dispatch:
     inputs:
       workers:
-        description: 'Workers this run starts next to the head (1 to 31 in this build; a free account runs 20 jobs at once and the head is one of them)'
+        description: 'Workers this run starts next to the head (1 to 40 in this build; a free account runs 20 jobs at once and the head is one of them)'
         type: string
         default: '19'
       total:
@@ -19,7 +19,7 @@ on:
         type: string
         default: llmsrc
       source:
-        description: 'Link to the llama.cpp source zip of the release tag, built on every runner with the device limit raised from 16 to 32'
+        description: 'Link to the llama.cpp source zip of the release tag, built on every runner with the device limit raised from 16 to 64'
         type: string
         default: 'https://github.com/ggml-org/llama.cpp/archive/refs/tags/b11612.zip'
       model:
@@ -57,7 +57,7 @@ jobs:
         run: |
           import json, os, re, sys
           workers, total, join = os.environ["WORKERS"].strip(), os.environ["TOTAL"].strip(), os.environ["JOIN"] == "true"
-          cap = 31
+          cap = 40
           problem = ""
           if not re.fullmatch("[a-z0-9]{1,16}", os.environ["CLUSTER"]):
               problem = "The cluster name can only use lowercase letters and digits, up to 16 characters"
@@ -413,7 +413,7 @@ jobs:
               z.extractall(src_dir)
           src = [os.path.join(src_dir, d) for d in os.listdir(src_dir) if os.path.exists(os.path.join(src_dir, d, "CMakeLists.txt"))][:1] or fail("The source zip has no folder with a CMakeLists.txt in it")
           src = src[0]
-          for rel, pat, rep in (("ggml/src/ggml-backend.cpp", r"(#define GGML_SCHED_MAX_BACKENDS )16\b", r"\g<1>32"), ("src/llama.cpp", r"(size_t llama_max_devices\(void\) \{\s*return )16;", r"\g<1>32;")):
+          for rel, pat, rep in (("ggml/src/ggml-backend.cpp", r"(#define GGML_SCHED_MAX_BACKENDS )16\b", r"\g<1>64"), ("src/llama.cpp", r"(size_t llama_max_devices\(void\) \{\s*return )16;", r"\g<1>64;")):
               path = os.path.join(src, rel)
               text, n = re.subn(pat, rep, open(path, encoding="utf-8").read())
               n == 1 or fail(f"{rel} has the device limit {n} times, expected once")
