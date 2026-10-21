@@ -1,0 +1,597 @@
+name: LLM Cluster (source build)
+on:
+  workflow_dispatch:
+    inputs:
+      workers:
+        description: 'Workers this run starts next to the head (1 to 31 in this build; a free account runs 20 jobs at once and the head is one of them)'
+        type: string
+        default: '19'
+      total:
+        description: 'Only when other runs add workers to this account: total workers across all runs (0 = this run only)'
+        type: string
+        default: '0'
+      join:
+        description: 'Only add workers to a cluster whose head runs in another repo of the same account (this run starts no head)'
+        type: boolean
+        default: false
+      cluster:
+        description: 'Cluster name, the same in every repo of the account that takes part (lowercase letters and digits)'
+        type: string
+        default: llmsrc
+      source:
+        description: 'Link to the llama.cpp source zip of the release tag, built on every runner with the device limit raised from 16 to 32'
+        type: string
+        default: 'https://github.com/ggml-org/llama.cpp/archive/refs/tags/b11612.zip'
+      model:
+        description: 'qwen3-30b-a3b = 18 GB test model, gpt-oss-120b = 63 GB model (needs 6 or more workers)'
+        type: choice
+        options: [qwen3-30b-a3b, gpt-oss-120b]
+        default: qwen3-30b-a3b
+      minutes:
+        description: 'Minutes to keep the model running once it is ready (GitHub stops a job after 6 hours anyway)'
+        type: choice
+        options: ['30', '60', '120', '180', '240', '300', '360']
+        default: '60'
+      windows:
+        description: 'auto = Windows Server 2022 (the Windows 10 generation) first, Windows Server 2025 (the Windows 11 generation) when 2022 is busy'
+        type: choice
+        options: [auto, windows-2022, windows-2025]
+        default: auto
+permissions: {}
+jobs:
+  pick:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      nodes: ${{ steps.pick.outputs.nodes }}
+      images: ${{ steps.pick.outputs.images }}
+    steps:
+      - id: pick
+        shell: python
+        env:
+          WORKERS: ${{ inputs.workers }}
+          TOTAL: ${{ inputs.total }}
+          JOIN: ${{ inputs.join }}
+          CLUSTER: ${{ inputs.cluster }}
+          WINDOWS: ${{ inputs.windows }}
+        run: |
+          import json, os, re, sys
+          workers, total, join = os.environ["WORKERS"].strip(), os.environ["TOTAL"].strip(), os.environ["JOIN"] == "true"
+          cap = 31
+          problem = ""
+          if not re.fullmatch("[a-z0-9]{1,16}", os.environ["CLUSTER"]):
+              problem = "The cluster name can only use lowercase letters and digits, up to 16 characters"
+          elif not (workers.isdigit() and total.isdigit()):
+              problem = "Workers and total must be whole numbers"
+          else:
+              workers, total = int(workers), int(total)
+              if workers < 1 or workers > cap:
+                  problem = f"Workers must be from 1 to {cap} in this build"
+              elif total > cap:
+                  problem = f"total ({total}) is more than this build runs ({cap})"
+              elif total and total < workers and not join:
+                  problem = f"total ({total}) is smaller than workers ({workers}), use 0 or at least {workers}"
+          if problem:
+              print("::error::" + problem)
+              sys.exit(1)
+          nodes = list(range(1 if join else 0, workers + 1))
+          images = ["windows-2022", "windows-2025"] if os.environ["WINDOWS"] == "auto" else [os.environ["WINDOWS"]]
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write("nodes=" + json.dumps(nodes) + "\n")
+              f.write("images=" + json.dumps(images) + "\n")
+  node:
+    needs: pick
+    name: ${{ matrix.node == 0 && 'head' || format('worker {0}', matrix.node) }} on ${{ matrix.image }}
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ${{ fromJSON(needs.pick.outputs.nodes) }}
+        image: ${{ fromJSON(needs.pick.outputs.images) }}
+    runs-on: ${{ matrix.image }}
+    timeout-minutes: 360
+    permissions:
+      actions: read
+    defaults:
+      run:
+        shell: python
+    env:
+      NODE: ${{ matrix.node }}
+      LABEL: ${{ matrix.image }}
+      LABELS: ${{ needs.pick.outputs.images }}
+      WORKERS: ${{ inputs.workers }}
+      TOTAL: ${{ inputs.total }}
+      CLUSTER: ${{ inputs.cluster }}
+      SOURCE: ${{ inputs.source }}
+      MODEL: ${{ inputs.model }}
+      MINUTES: ${{ inputs.minutes }}
+      GH_TOKEN: ${{ github.token }}
+      TS_OAUTH_CLIENT_ID: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+      TS_OAUTH_CLIENT_SECRET: ${{ secrets.TS_OAUTH_CLIENT_SECRET }}
+      API_KEY: ${{ secrets.LLM_API_KEY }}
+    steps:
+      - name: cluster
+        run: |
+          import calendar, concurrent.futures, ctypes, errno, json, os, platform, re, shutil, socket, socketserver, subprocess, sys, tempfile, threading, time, urllib.error, urllib.parse, urllib.request, zipfile
+          sys.stdout.reconfigure(line_buffering=True, errors="replace")
+          T0 = time.time()
+          CID, CSEC, GHT = (os.environ.pop(k, "") for k in ("TS_OAUTH_CLIENT_ID", "TS_OAUTH_CLIENT_SECRET", "GH_TOKEN"))
+          API_KEY = os.environ.pop("API_KEY", "")
+          NODE, WORKERS, TOTAL, MINUTES = (int(os.environ[k]) for k in ("NODE", "WORKERS", "TOTAL", "MINUTES"))
+          MODEL, CLUSTER, LABEL = (os.environ[k] for k in ("MODEL", "CLUSTER", "LABEL"))
+          LABELS = json.loads(os.environ["LABELS"])
+          SOURCE = os.environ["SOURCE"]
+          HEAD = NODE == 0
+          WANT = TOTAL or WORKERS
+          LIMIT = 350 * 60
+          GRACE = 30
+          TAG = "b11612"
+          ALLOW = "100.64.0.0/10"
+          CTLS = [5201, 15201, 25201, 35201, 45201]
+          RPCS = [15052, 25052, 35052, 45052, 5052]
+          APIS = [8080, 18080, 28080, 38080, 48080]
+          MODELS = {
+              "qwen3-30b-a3b": ("https://huggingface.co/Qwen/Qwen3-30B-A3B-GGUF/resolve/main/Qwen3-30B-A3B-Q4_K_M.gguf", 18556685824),
+              "gpt-oss-120b": ("https://huggingface.co/ggml-org/gpt-oss-120b-GGUF/resolve/main/gpt-oss-120b-MXFP4.gguf", 63387346208),
+          }
+          URL, SIZE = MODELS[MODEL]
+          WORK = os.environ["RUNNER_TEMP"]
+          TMP = tempfile.gettempdir()
+          BIN = os.path.join(WORK, "llama")
+          RUN = os.environ["GITHUB_RUN_ID"] + "-" + os.environ["GITHUB_RUN_ATTEMPT"]
+          ROLE = "head" if HEAD else f"worker {NODE}"
+          HOST = f"{CLUSTER}-head-{RUN}" if HEAD else f"{CLUSTER}-w-{RUN}-{NODE}"
+          STOP = threading.Event()
+          SEEN = [0.0]
+          CLAIMED = [""]
+          WIPS = []
+          NAME = {}
+          BUSY = set()
+          REJECTED = set()
+          GONE = set()
+          OWNER = [""]
+          PORT = {}
+          RP = 0
+          def fail(msg):
+              print("::error::" + msg)
+              sys.exit(1)
+          def say(msg):
+              print(time.strftime("[%H:%M:%S] ") + msg)
+          def gb(n):
+              return f"{n / 1e9:.1f} GB"
+          def get(*cmd, **kw):
+              try:
+                  return subprocess.run(cmd, capture_output=True, text=True, errors="replace", timeout=90, **kw).stdout.strip()
+              except subprocess.TimeoutExpired:
+                  return ""
+          def run(*cmd, **kw):
+              kw.setdefault("check", True)
+              return subprocess.run(cmd, **kw)
+          def wait(test, secs, what, why=lambda: ""):
+              end = time.time() + secs
+              while True:
+                  value = test()
+                  if value:
+                      return value
+                  if time.time() > end:
+                      fail("Timed out waiting for " + what + why())
+                  time.sleep(3)
+          def fetch(url, path, size=0):
+              for attempt in range(8):
+                  have = os.path.getsize(path) if size and os.path.exists(path) else 0
+                  if size and have == size:
+                      return True
+                  try:
+                      req = urllib.request.Request(url, headers={"Range": f"bytes={have}-"} if have else {})
+                      with urllib.request.urlopen(req, timeout=60) as r, open(path, "ab" if have and r.status == 206 else "wb") as f:
+                          last = time.time()
+                          while True:
+                              chunk = r.read(1 << 22)
+                              if not chunk:
+                                  break
+                              f.write(chunk)
+                              if size and time.time() - last > 60:
+                                  last = time.time()
+                                  say(f"downloading {os.path.basename(path)}: {gb(f.tell())} of {gb(size)}")
+                      if not size or os.path.getsize(path) == size:
+                          return True
+                  except Exception as e:
+                      print(f"Download failed: {url} ({e})")
+                  time.sleep(5)
+              return False
+          def api(path, data, headers):
+              try:
+                  with urllib.request.urlopen(urllib.request.Request("https://api.tailscale.com/api/v2/" + path, data=data, headers=headers), timeout=30) as r:
+                      return json.load(r)
+              except urllib.error.HTTPError as e:
+                  fail(f"Tailscale API {path} returned {e.code}: {e.read().decode()[:300]}")
+              except Exception as e:
+                  fail(f"Tailscale API {path} failed: {e}")
+          def taken(ip, port):
+              s = socket.socket()
+              try:
+                  s.bind((ip, port))
+                  return False
+              except OSError as e:
+                  return e.errno == errno.EADDRINUSE or getattr(e, "winerror", 0) == 10048
+              finally:
+                  s.close()
+          def pick(ports):
+              for p in ports:
+                  if taken(IP, p):
+                      say(f"port {p} is already in use")
+                      continue
+                  s = socket.socket()
+                  try:
+                      s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                      s.bind((IP, p))
+                      s.listen(1)
+                      return p
+                  except OSError as e:
+                      say(f"port {p} is not usable here: {e}")
+                  finally:
+                      s.close()
+              return 0
+          def find(ip):
+              for p in CTLS:
+                  PORT[ip] = p
+                  try:
+                      if ask(ip, b"PING", 3) == "PONG":
+                          return True
+                  except OSError:
+                      pass
+              return False
+          def start_rpc(host):
+              for port in RPCS:
+                  proc = subprocess.Popen([os.path.join(BIN, "ggml-rpc-server.exe"), "-H", host, "-p", str(port), "-t", str(max(1, (os.cpu_count() or 2) // 2))], cwd=BIN, creationflags=subprocess.CREATE_NEW_PROCESS_GROUP)
+                  began = time.time()
+                  wait(lambda: proc.poll() is not None or taken(host, port) or time.time() - began > 15, 60, "the RPC server to start")
+                  if proc.poll() is None:
+                      return proc, port
+                  say(f"The RPC server stopped with code {proc.returncode} on port {port}, trying the next port")
+              fail("The RPC server could not start on any port, see the lines above")
+          class MemStatus(ctypes.Structure):
+              _fields_ = [("length", ctypes.c_ulong), ("load", ctypes.c_ulong)] + [(n, ctypes.c_ulonglong) for n in ("total", "avail", "pf_total", "pf_avail", "v_total", "v_avail", "v_ext")]
+          def ram():
+              m = MemStatus()
+              m.length = ctypes.sizeof(m)
+              ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(m))
+              return m.avail, m.total
+          def ts(*args):
+              return get(*TS, *args)
+          def ask(ip, line, timeout=30):
+              with socket.create_connection((ip, PORT[ip]), timeout=timeout) as s:
+                  s.sendall(line + b"\n")
+                  return s.makefile("rb").readline().decode().strip()
+          class Ctl(socketserver.StreamRequestHandler):
+              disable_nagle_algorithm = True
+              def handle(self):
+                  while True:
+                      parts = self.rfile.readline().split()
+                      if not parts:
+                          return
+                      if parts[0] not in (b"PING", b"CLAIM") and self.client_address[0] != OWNER[0]:
+                          self.wfile.write(b"DENIED\n")
+                          return
+                      SEEN[0] = time.time()
+                      if parts[0] == b"PING":
+                          self.wfile.write(b"PONG\n")
+                      elif parts[0] == b"CLAIM":
+                          who = b" ".join(parts[2:]).decode()
+                          if parts[1:2] != [API_KEY.encode()]:
+                              self.wfile.write(b"DENIED\n")
+                          elif CLAIMED[0] in ("", who):
+                              if CLAIMED[0] == "":
+                                  say("claimed by " + who)
+                                  print(get("netsh", "advfirewall", "firewall", "add", "rule", "name=llm-cluster-rpc", "dir=in", "action=allow", "protocol=TCP", "localport=" + str(RP), "remoteip=" + self.client_address[0]))
+                                  OWNER[0] = self.client_address[0]
+                              CLAIMED[0] = who
+                              self.wfile.write(b"OK\n")
+                          else:
+                              self.wfile.write(b"BUSY\n")
+                      elif parts[0] == b"LEFT":
+                          self.wfile.write(f"{int(T0 + LIMIT - time.time())}\n".encode())
+                      elif parts[0] == b"MEM":
+                          self.wfile.write(f"{ram()[0]}\n".encode())
+                      elif parts[0] == b"RPC":
+                          self.wfile.write(f"{RP}\n".encode())
+                      elif parts[0] == b"SINK":
+                          while self.rfile.read(1 << 20):
+                              pass
+                          self.wfile.write(b"OK\n")
+                      elif parts[0] == b"QUIT":
+                          self.wfile.write(b"BYE\n")
+                          STOP.set()
+                          return
+          class Server(socketserver.ThreadingTCPServer):
+              allow_reuse_address = True
+              daemon_threads = True
+          def latency(ip, n=200):
+              with socket.create_connection((ip, PORT[ip]), timeout=30) as s:
+                  s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                  f = s.makefile("rb")
+                  ms = []
+                  for _ in range(n):
+                      t = time.perf_counter()
+                      s.sendall(b"PING\n")
+                      f.readline()
+                      ms.append((time.perf_counter() - t) * 1000)
+              ms.sort()
+              return ms[0], ms[n // 2], ms[int(n * 0.95)]
+          def upload(ip, secs=10):
+              block = bytes(1 << 20)
+              with socket.create_connection((ip, PORT[ip]), timeout=120) as s:
+                  s.sendall(b"SINK\n")
+                  t = time.perf_counter()
+                  mb = 0
+                  while time.perf_counter() - t < secs and mb < 512:
+                      s.sendall(block)
+                      mb += 1
+                  s.shutdown(socket.SHUT_WR)
+                  s.makefile("rb").readline()
+                  return mb * 8.388608 / (time.perf_counter() - t)
+          def chat(prompt, tokens):
+              body = json.dumps({"messages": [{"role": "user", "content": prompt}], "max_tokens": tokens, "temperature": 0, "cache_prompt": True}).encode()
+              with urllib.request.urlopen(urllib.request.Request(f"http://{IP}:{AP}/v1/chat/completions", data=body, headers={"Content-Type": "application/json", "Authorization": "Bearer " + API_KEY}), timeout=1800) as r:
+                  return json.load(r)
+          def healthy():
+              try:
+                  with urllib.request.urlopen(f"http://{IP}:{AP}/health", timeout=5) as r:
+                      return r.status == 200
+              except Exception:
+                  return False
+          def memory_line():
+              parts = [gb(ram()[0])]
+              for ip in WIPS:
+                  try:
+                      parts.append(gb(int(ask(ip, b"MEM", 10))))
+                  except Exception:
+                      parts.append("?")
+              return "free RAM (head, workers): " + ", ".join(parts)
+          def peers():
+              try:
+                  found = json.loads(ts("status", "--json")).get("Peer") or {}
+              except ValueError:
+                  return {}
+              out = {}
+              for p in found.values():
+                  v4 = [a for a in p.get("TailscaleIPs") or [] if "." in a]
+                  if p.get("Online") and v4 and p.get("HostName", "").startswith(CLUSTER + "-w-"):
+                      out[p["HostName"]] = v4[0]
+              return out
+          def jobs():
+              url = f"https://api.github.com/repos/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{os.environ['GITHUB_RUN_ID']}/attempts/{os.environ['GITHUB_RUN_ATTEMPT']}/jobs?per_page=100"
+              with urllib.request.urlopen(urllib.request.Request(url, headers={"Authorization": "Bearer " + GHT, "Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28"}), timeout=30) as r:
+                  return {j["name"]: j for j in json.load(r)["jobs"]}
+          def settle():
+              try:
+                  found = jobs()
+              except Exception as e:
+                  say(f"Could not read the job list from GitHub ({e}), so no worker is counted as ended")
+                  return False
+              joined = {NAME[ip] for ip in WIPS}
+              open_nodes = []
+              for n in range(1, WORKERS + 1):
+                  name = f"{CLUSTER}-w-{RUN}-{n}"
+                  if name in joined or name in REJECTED:
+                      continue
+                  mine = [j for k, j in found.items() if k.startswith(f"worker {n} on ")]
+                  if mine and all(j["status"] == "completed" for j in mine):
+                      if n not in GONE:
+                          GONE.add(n)
+                          say(f"worker {n} has ended on GitHub without joining, not waiting for it")
+                      continue
+                  open_nodes.append(n)
+              return not open_nodes
+          def beaten():
+              if len(LABELS) < 2:
+                  return False
+              other = [x for x in LABELS if x != LABEL][0]
+              time.sleep(8 + GRACE * LABELS.index(LABEL))
+              try:
+                  found = jobs()
+                  mine, twin = found[f"{ROLE} on {LABEL}"], found[f"{ROLE} on {other}"]
+              except Exception as e:
+                  say(f"Could not read the job list from GitHub ({e}), so this node may run on both Windows versions")
+                  return False
+              when = lambda j, label: (calendar.timegm(time.strptime(j["started_at"], "%Y-%m-%dT%H:%M:%SZ")) + GRACE * LABELS.index(label), LABELS.index(label))
+              return twin["status"] == "in_progress" and when(twin, other) < when(mine, LABEL)
+          if beaten():
+              print(f"::notice::{ROLE} already runs on the other Windows version, so this {LABEL} runner stops on purpose")
+              sys.exit(0)
+          if len(CID) < 4 or len(CSEC) < 4:
+              fail("Set the secrets TS_OAUTH_CLIENT_ID and TS_OAUTH_CLIENT_SECRET")
+          if len(API_KEY) < 16 or not API_KEY.isalnum():
+              fail("Set the secret LLM_API_KEY to letters and digits, at least 16 characters, the same in every repo that takes part")
+          avail, total = ram()
+          print(f"This runner: {ROLE} on {LABEL} ({platform.system()} {platform.release()} {platform.version()}), {os.cpu_count()} CPUs, RAM {gb(total)} ({gb(avail)} free), {WORK[:2]} drive {gb(shutil.disk_usage(WORK).free)} free, C: drive {gb(shutil.disk_usage('C:/').free)} free")
+          if HEAD:
+              print(f"PLAN  {MODEL} ({gb(SIZE)}) on 1 head + {WANT} workers ({WORKERS} from this run) in cluster {CLUSTER}, llama.cpp {TAG} built from source, stays up {MINUTES} min once ready")
+          src_zip = os.path.join(WORK, "source.zip")
+          fetch(SOURCE, src_zip) or fail("Could not download the llama.cpp source zip from " + SOURCE)
+          src_dir = os.path.join(WORK, "source")
+          with zipfile.ZipFile(src_zip) as z:
+              z.extractall(src_dir)
+          src = [os.path.join(src_dir, d) for d in os.listdir(src_dir) if os.path.exists(os.path.join(src_dir, d, "CMakeLists.txt"))][:1] or fail("The source zip has no folder with a CMakeLists.txt in it")
+          src = src[0]
+          for rel, pat, rep in (("ggml/src/ggml-backend.cpp", r"(#define GGML_SCHED_MAX_BACKENDS )16\b", r"\g<1>32"), ("src/llama.cpp", r"(size_t llama_max_devices\(void\) \{\s*return )16;", r"\g<1>32;")):
+              path = os.path.join(src, rel)
+              text, n = re.subn(pat, rep, open(path, encoding="utf-8").read())
+              n == 1 or fail(f"{rel} has the device limit {n} times, expected once")
+              open(path, "w", encoding="utf-8", newline="\n").write(text)
+          targets = ["llama-server", "ggml-rpc-server"] if HEAD else ["ggml-rpc-server"]
+          exes = [t + ".exe" for t in targets]
+          build = os.path.join(src, "build")
+          say("building " + " and ".join(targets) + " from " + SOURCE)
+          t0 = time.time()
+          run("cmake", "-S", src, "-B", build, "-DCMAKE_BUILD_TYPE=Release", "-DBUILD_SHARED_LIBS=OFF", "-DGGML_RPC=ON", "-DLLAMA_OPENSSL=OFF", "-DLLAMA_BUILD_TESTS=OFF", "-DLLAMA_BUILD_EXAMPLES=OFF", "-DLLAMA_BUILD_NUMBER=" + TAG[1:], check=False).returncode == 0 or fail("cmake could not set up the llama.cpp build, see the lines above")
+          run("cmake", "--build", build, "--config", "Release", "--parallel", "--target", *targets, check=False).returncode == 0 or fail("The llama.cpp build failed, see the lines above")
+          os.makedirs(BIN, exist_ok=True)
+          for exe in exes:
+              hits = [os.path.join(d, exe) for d, _, names in os.walk(build) if exe in names]
+              hits or fail(exe + " was not built")
+              shutil.copy(hits[0], BIN)
+          say("built " + " and ".join(exes) + " in " + str(round((time.time() - t0) / 60, 1)) + " min")
+          msi = os.path.join(TMP, "tailscale.msi")
+          fetch("https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi", msi) or fail("Could not download Tailscale")
+          sig = get("powershell", "-NoProfile", "-Command", f"$s = Get-AuthenticodeSignature '{msi}'; $s.Status; $s.SignerCertificate.Subject")
+          if not sig.startswith("Valid") or "Tailscale" not in sig:
+              fail("Tailscale installer signature check failed: " + sig)
+          if run("msiexec", "/i", msi, "/quiet", "/norestart", check=False).returncode not in (0, 3010):
+              fail("Tailscale installation failed")
+          run("powershell", "-NoProfile", "-Command", "Start-Service Tailscale", check=False)
+          TS = [p for p in (os.path.join(d, "Tailscale", "tailscale.exe") for d in (os.environ.get("ProgramFiles"), os.environ.get("ProgramW6432"), os.environ.get("ProgramFiles(x86)")) if d) if os.path.exists(p)][:1] or fail("tailscale.exe not found")
+          token = api("oauth/token", urllib.parse.urlencode({"client_id": CID, "client_secret": CSEC}).encode(), {})["access_token"]
+          print("::add-mask::" + token)
+          key = api("tailnet/-/keys", json.dumps({"capabilities": {"devices": {"create": {"reusable": False, "ephemeral": True, "preauthorized": True, "tags": ["tag:ci"]}}}, "expirySeconds": 600}).encode(), {"Authorization": "Bearer " + token, "Content-Type": "application/json"})["key"]
+          print("::add-mask::" + key)
+          run(*TS, "up", "--authkey=" + key, "--hostname=" + HOST, "--timeout=120s", "--unattended")
+          wait(lambda: ts("ip", "-4"), 90, "a Tailscale address")
+          IP = ts("ip", "-4").splitlines()[0]
+          print(f"Tailscale address {IP} as {HOST}")
+          print(ts("netcheck"))
+          print(get("netsh", "int", "ipv4", "show", "excludedportrange", "protocol=tcp"))
+          print(get("netsh", "advfirewall", "firewall", "add", "rule", "name=llm-cluster", "dir=in", "action=allow", "protocol=TCP", "localport=" + ",".join(str(p) for p in CTLS + APIS), "remoteip=" + ALLOW))
+          if not HEAD:
+              rpc = None
+              try:
+                  rpc, RP = start_rpc(IP)
+                  for CP in CTLS:
+                      try:
+                          ctl = Server((IP, CP), Ctl)
+                          break
+                      except OSError as e:
+                          say(f"port {CP} is not usable here: {e}")
+                  else:
+                      fail("No usable control port")
+                  threading.Thread(target=ctl.serve_forever, daemon=True).start()
+                  say(f"READY as a worker of cluster {CLUSTER}, RPC port {RP}, control port {CP}, waiting for the head")
+                  started = time.time()
+                  while not STOP.is_set():
+                      rpc.poll() is None or fail(f"The RPC server stopped with code {rpc.returncode}, free RAM {gb(ram()[0])}")
+                      quiet = time.time() - (SEEN[0] or started)
+                      quiet < (15 if SEEN[0] else 40) * 60 or fail(f"The head has been silent for {quiet / 60:.0f} min, shutting down")
+                      say(f"worker alive, free RAM {gb(ram()[0])}")
+                      STOP.wait(60)
+                  print("The head is finished, shutting down")
+              except KeyboardInterrupt:
+                  say("The run was cancelled, stopping this worker")
+              finally:
+                  if rpc is not None:
+                      rpc.terminate()
+              sys.exit(0)
+          srv = None
+          try:
+              me = b"CLAIM " + API_KEY.encode() + b" " + HOST.encode()
+              def pulse():
+                  while True:
+                      time.sleep(30)
+                      for ip in list(WIPS):
+                          try:
+                              ask(ip, me, 10)
+                          except Exception:
+                              pass
+              threading.Thread(target=pulse, daemon=True).start()
+              end = time.time() + 2400
+              shown = checked = 0
+              settled = False
+              with concurrent.futures.ThreadPoolExecutor(16) as pool:
+                  while len(WIPS) < WANT and time.time() < end and not settled:
+                      fresh = [c for c in sorted(peers().items()) if c[1] not in WIPS and c[1] not in BUSY]
+                      for (name, ip), up in zip(fresh, pool.map(lambda c: find(c[1]), fresh)):
+                          if up and len(WIPS) < WANT:
+                              try:
+                                  reply = ask(ip, me)
+                              except OSError:
+                                  continue
+                              if reply == "OK":
+                                  NAME[ip] = name
+                                  WIPS.append(ip)
+                                  say(f"worker {len(WIPS)} of {WANT} joined: {name} {ip}")
+                              else:
+                                  BUSY.add(ip)
+                                  if reply == "DENIED":
+                                      REJECTED.add(name)
+                                      say(f"{name} has another LLM_API_KEY, skipping it")
+                                  else:
+                                      say(f"{name} works for another head, skipping it")
+                      if WANT == WORKERS and time.time() - checked > 60:
+                          checked = time.time()
+                          settled = settle()
+                      if len(WIPS) < WANT and time.time() - shown > 60:
+                          shown = time.time()
+                          say(f"waiting for workers of cluster {CLUSTER}: {len(WIPS)} of {WANT} joined, {len([c for c in fresh if c[1] not in WIPS])} more seen on Tailscale but not ready")
+                      len(WIPS) < WANT and time.sleep(5)
+              if len(WIPS) < WANT:
+                  print(ts("status"))
+                  WIPS or fail(f"No worker joined cluster {CLUSTER} - check that the worker jobs ran without errors (see their logs), that they use the same cluster name, the same Tailscale secrets and the same LLM_API_KEY, and that the Tailscale access rules let tag:ci reach tag:ci on all ports")
+                  say(f"Only {len(WIPS)} of {WANT} workers joined, going on with those if the model fits")
+              DEAD = min([T0 + LIMIT] + [time.time() + int(ask(ip, b"LEFT", 10)) for ip in WIPS])
+              def probe(ip):
+                  return ts("ping", "--c", "5", NAME[ip]), latency(ip)
+              with concurrent.futures.ThreadPoolExecutor(len(WIPS)) as pool:
+                  probes = list(pool.map(probe, WIPS))
+              status = ts("status")
+              rates = []
+              for i, (ip, (pong, (lo, mid, hi))) in enumerate(zip(WIPS, probes), 1):
+                  print(pong)
+                  mbps = upload(ip, 10 if len(WIPS) <= 4 else 4)
+                  rates.append(mbps)
+                  print(f"NETWORK  worker {i} {NAME[ip]} {ip}: round trip {mid:.1f} ms (best {lo:.1f}, 95% under {hi:.1f}), upload {mbps:.0f} Mbps")
+                  print("  " + "\n  ".join(l.strip() for l in status.splitlines() if NAME[ip] in l))
+              push = SIZE * len(WIPS) / (len(WIPS) + 1) * 8 / (sum(rates) / len(rates) * 1e6)
+              print(f"Sending the model to the workers at this speed takes about {push / 60:.0f} min")
+              free = [int(ask(ip, b"MEM")) for ip in WIPS]
+              print(f"MEMORY  model {gb(SIZE)}, free RAM per worker: {', '.join(gb(x) for x in free)}, total {gb(sum(free))}, head {gb(ram()[0])}")
+              need = SIZE + 2e9 * len(free)
+              sum(free) > need or fail(f"The model needs about {gb(need)} of RAM on {len(free)} workers but they have {gb(sum(free))} free in total, " + (f"{WANT - len(WIPS)} workers did not join, " if len(WIPS) < WANT else "") + "add workers or pick a smaller model")
+              ram()[0] > 4e9 or fail(f"The head runner has only {gb(ram()[0])} of RAM free, it needs 4 GB")
+              model = os.path.join(WORK, URL.rsplit("/", 1)[-1])
+              shutil.disk_usage(WORK).free > SIZE + 3e9 or fail("Not enough free disk space for the model on " + WORK[:2])
+              t0 = time.time()
+              fetch(URL, model, SIZE) or fail("Could not download the model")
+              say(f"model downloaded in {(time.time() - t0) / 60:.1f} min")
+              AP = wait(lambda: pick(APIS), 30, "a usable port for the web server")
+              srv = subprocess.Popen([os.path.join(BIN, "llama-server.exe"), "-m", model, "--rpc", ",".join(f"{ip}:{ask(ip, b'RPC')}" for ip in WIPS), "--host", IP, "--port", str(AP), "-c", "8192", "-np", "1", "--cache-ram", "1024", "--api-key", API_KEY, "--cors-origins", f"http://{IP}:{AP}", "-ngl", "999", "-fit", "off"], cwd=BIN, creationflags=subprocess.CREATE_NEW_PROCESS_GROUP)
+              beat = [0.0]
+              def loaded():
+                  srv.poll() is None or fail(f"llama-server stopped with code {srv.returncode}, see the log lines above")
+                  if time.time() - beat[0] > 60:
+                      beat[0] = time.time()
+                      say("loading the model, " + memory_line())
+                  return healthy()
+              t0 = time.time()
+              wait(loaded, 7200, "the model to load")
+              say(f"model loaded in {(time.time() - t0) / 60:.1f} min")
+              for prompt, tokens in (("Say hello in five words.", 32), ("Summarize in one sentence: " + "The quick brown fox jumps over the lazy dog. " * 40, 48)):
+                  j = chat(prompt, tokens)
+                  t = j["timings"]
+                  m = j["choices"][0]["message"]
+                  print(f"SELFTEST  prompt {t['prompt_n']} tokens at {t['prompt_per_second']:.1f} tokens/s, answer {t['predicted_n']} tokens at {t['predicted_per_second']:.2f} tokens/s")
+                  print("  " + (m.get("content") or m.get("reasoning_content") or "")[:150].replace("\n", " "))
+              until = min(time.time() + MINUTES * 60, DEAD)
+              left = int((until - time.time()) / 60)
+              print("=" * 44)
+              print(f"READY  to chat, open this in a browser: http://{IP}:{AP}")
+              print("Turn on Tailscale on your PC first. The page asks for an API key when it needs one: paste the LLM_API_KEY secret")
+              print(f"For other apps the OpenAI-style API base URL is http://{IP}:{AP}/v1 (it is not a web page), send the header Authorization: Bearer with the LLM_API_KEY secret")
+              print(f"It stays up for {left} minutes" + (f" (less than the {MINUTES} you asked for, because GitHub stops a job after 6 hours)" if left < MINUTES - 1 else "") + ". To stop earlier, cancel the workflow run")
+              print("=" * 44)
+              while time.time() < until:
+                  srv.poll() is None or fail(f"llama-server stopped with code {srv.returncode}, see the log lines above")
+                  say(f"serving, {int((until - time.time()) / 60)} min left, " + memory_line())
+                  time.sleep(min(60, max(1, until - time.time())))
+              print("Time is up")
+          except KeyboardInterrupt:
+              say("The run was cancelled, stopping the cluster")
+          finally:
+              if srv is not None:
+                  srv.terminate()
+                  try:
+                      srv.wait(30)
+                  except subprocess.TimeoutExpired:
+                      srv.kill()
+              for ip in WIPS:
+                  try:
+                      ask(ip, b"QUIT", 10)
+                  except Exception:
+                      pass
